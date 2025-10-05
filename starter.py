@@ -364,9 +364,29 @@ def compute_group_normalized_advantages(
     # 5. If `normalize_by_std` is True, normalize advantages by `(group_std + advantage_eps)`.
     # 6. Flatten the advantages tensor back into a 1D tensor.
     # 7. Create a `metadata` dictionary with overall statistics of the raw rewards.
-    advantages, raw_rewards, metadata = None, None, {}
+    
     ### YOUR CODE HERE ###
-    pass
+    #1. Calculate the raw reward for each response using the provided `reward_fn`.
+    raw_rewards_list = [reward_fn(response, ground_truth) for response, ground_truth in zip(rollout_responses, repeated_ground_truths)]
+    raw_rewards = torch.tensor(raw_rewards_list, dtype=torch.float32)
+    #2. Reshape the 1D tensor of raw rewards into a 2D tensor of shape (-1, `group_size`).
+    raw_rewards = raw_rewards.reshape(-1, group_size)
+    #3. Calculate the mean reward for each group.
+    group_means = raw_rewards.mean(dim=1, keepdim=True)
+    #4. Compute the advantage by subtracting the group's mean reward.
+    advantages = raw_rewards - group_means.unsqueeze(1)
+    #5. If `normalize_by_std` is True, normalize advantages by `(group_std + advantage_eps)`.
+    if normalize_by_std:
+        advantages = advantages / (advantages.std(dim=1, keepdim=True) + advantage_eps)
+    #6. Flatten the advantages tensor back into a 1D tensor.
+    advantages = advantages.reshape(-1)
+    #7. Create a `metadata` dictionary with overall statistics of the raw rewards.
+    metadata = {
+        "mean": raw_rewards.mean().item(),
+        "std": raw_rewards.std().item(),
+        "max": raw_rewards.max().item(),
+        "min": raw_rewards.min().item(),
+    }
     ### END YOUR CODE ###
     return advantages, raw_rewards, metadata
 
@@ -395,9 +415,18 @@ def compute_loss(
        and then multiplying by `advantages`.
     4. The final loss is `-torch.minimum(unclipped_term, clipped_term)`.
     """
-    loss = 0.0
+    
     ### YOUR CODE HERE ###
-    pass
+    #1. Calculate the probability ratio `pi_ratio = exp(policy_log_probs - old_log_probs)`.
+    log_ratio = policy_log_probs - old_log_probs
+    pi_ratio = torch.exp(log_ratio)
+    #2. Calculate the unclipped term: `advantages * pi_ratio`.
+    unclipped_term = advantages * pi_ratio
+    #3. Calculate the clipped term by clipping `pi_ratio` to `[1-clip_range, 1+clip_range]`
+    clipped_term = torch.clamp(pi_ratio, 1-clip_range, 1+clip_range) * advantages
+    #4. The final loss is `-torch.minimum(unclipped_term, clipped_term)`.
+    loss = -torch.minimum(unclipped_term, clipped_term)
+
     ### END YOUR CODE ###
     return loss
 
@@ -407,7 +436,8 @@ def masked_mean(tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     Compute the mean of tensor values where mask=True for each row, then average across the batch.
     """
     ### YOUR CODE HERE ###
-    pass
+    masked_tensor = tensor * mask
+    return (masked_tensor.sum()) / (mask.sum() + 1e-8)
     ### END YOUR CODE ###
 
 def masked_mean_drgrpo(tensor: torch.Tensor, mask: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -416,7 +446,8 @@ def masked_mean_drgrpo(tensor: torch.Tensor, mask: torch.Tensor, num_tokens: int
     This is used for the DR-GRPO loss
     """
     ### YOUR CODE HERE ###
-    pass
+    masked_tensor = tensor * mask
+    return (masked_tensor.sum(dim=-1) / num_tokens).mean()
     ### END YOUR CODE ###
 
 def get_response_log_probs(model: PreTrainedModel, input_ids: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
