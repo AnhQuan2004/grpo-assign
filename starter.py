@@ -135,12 +135,18 @@ def _extract_answer(solution_str: str) -> str | None:
         The stripped string content of the last answer tag, or None if no tag is found.
     """
     ### YOUR CODE HERE ###
-    match = re.finditer(r"<answer>(.*?)</answer>", solution_str, re.DOTALL)
-    all_matches = list(match)
-    if all_matches:
-        return all_matches[-1].group(1).strip()
-    return None
+    if not solution_str:
+        return None
+    matches = list(re.finditer(r"<answer>\s*(.*?)\s*</answer>", solution_str, flags=re.DOTALL | re.IGNORECASE))
+    return matches[-1].group(1).strip() if matches else None
     ### END YOUR CODE ###
+
+
+# Input/Output Format:
+rollout_response = "Okay, let's see. I need to use 79, 17, ... So the equation is ,→ <answer>(79 - (60 - 17))</answer>"
+extracted_answer = _extract_answer(rollout_response)
+assert extracted_answer == "(79 - (60 - 17))"
+print("✅ extract_answer: Test passed!")
 
 
 def _validate_numbers(equation_str: str, available_numbers: List[int]) -> bool:
@@ -159,27 +165,28 @@ def _validate_numbers(equation_str: str, available_numbers: List[int]) -> bool:
         True if the equation uses the correct numbers, False otherwise.
     """
     ### YOUR CODE HERE ###
-    #extract all numbers from the equation
-    numbers_in_equation = re.findall(r"\d+", equation_str)
-    #convert to integers
-    numbers_in_equation = [int(n) for n in numbers_in_equation]
+    try:
+        # Extract all numbers from the equation
+        found_numbers = re.findall(r"\d+", equation_str)
 
-    #sort both lists
-    numbers_in_equation.sort()
-    available_numbers.sort()
+        # Convert them into string
+        str_found_numbers = list(map(int, found_numbers))
 
-    # Count occurrences of each number
-    from collections import Counter
-    equation_counts = Counter(numbers_in_equation)
-    available_counts = Counter(available_numbers)
-    
-    # Check that each number in equation appears at most as many times as available
-    for num, count in equation_counts.items():
-        if count > available_counts.get(num, 0):
-            return False
-    
-    return True
+        # Compare (check for number & frequency - since each number must only appear once)
+        return sorted(str_found_numbers) == sorted(available_numbers)
+
+    except Exception:
+        return False
     ### END YOUR CODE ###
+
+
+assert _validate_numbers("(79 - (60 - 17))", [79, 60, 17]) == True
+assert _validate_numbers("(79 - 60)", [79, 60, 17]) == False
+assert _validate_numbers("(79 - 17 - 17)", [79, 60, 17]) == False
+assert _validate_numbers("79 + 60 + 17", [79, 17, 60]) == True
+assert _validate_numbers("", [1, 2, 3]) == False
+
+print("✅ validate_numbers: Tests passed!")
 
 
 def _evaluate_equation(equation_str: str) -> float | None:
@@ -191,17 +198,25 @@ def _evaluate_equation(equation_str: str) -> float | None:
         The result of the equation as a float, or None if it's invalid or unsafe.
     """
     ### YOUR CODE HERE ###
-    allow_chars = set('0123456789+-*/() .')
-    if not all(c in allow_chars for c in equation_str):
-        return None
-    
     try:
-        # Evaluate the equation
-        result = eval(equation_str)
+        # Allows only valid characters
+        if not re.fullmatch(r"[0-9+\-*/()\s]+", equation_str):
+            return None
+
+        # Evaluate
+        result = eval(equation_str, {"__builtins__": None}, {})
+
+        # Return to float
         return float(result)
-    except:
+
+    except Exception:
         return None
     ### END YOUR CODE ###
+
+
+assert _evaluate_equation("(65 - 7) - 7") == 51.0
+print("✅ evaluate_equation: Tests passed!")
+
 
 # ==============================================================================
 # TASK 2: Implement the Reward Function
@@ -226,19 +241,48 @@ def reward_fn(generated_text: str, ground_truth: Dict) -> float:
         A float value representing the reward, such as 1.0, 0.1, or 0.0
     """
     ### YOUR CODE HERE ###
-    target = ground_truth["target"]
-    numbers = ground_truth["numbers"]
+    target = ground_truth.get("target")
+    available_numbers = ground_truth.get("numbers", [])
+
+    # Extract Equation from <answer>
     equation = _extract_answer(generated_text)
-    result = _evaluate_equation(equation)
-    if equation is None or result is None:
+    if equation is None:
+        # No <answer> tag found
         return 0.0
-    if result == target and _validate_numbers(equation, numbers):
-        return 1.0
-    elif equation is not None:
+
+    # Validate Numbers
+    if not _validate_numbers(equation, available_numbers):
+        # Has <answer> tag, but wrong numbers
         return 0.1
+
+    # Safely Evaluate
+    result = _evaluate_equation(equation)
+    if result is None:
+        # Equation invalid for any reason
+        return 0.1
+
+    # Check for Correctness
+    if abs(result - target) < 1e-6:
+        return 1.0
     else:
-        return 0.0
+        return 0.1
     ### END YOUR CODE ###
+
+
+# Example 1: Correct Answer
+ground_truth = {"target": 36.0, "numbers": [79, 60, 17]}
+rollout = "...thinking... <answer>(79 - (60 - 17))</answer>"
+assert reward_fn(rollout, ground_truth) == 1.0
+
+# Example 2: Correct usage, Wrong Answer (Partial, R = 0.1)
+rollout = "...thinking...<answer>(79 + 60) + 17</answer>"
+assert reward_fn(rollout, ground_truth) == 0.1 # valid format of <answer>
+
+# Example 3: No Answer Tag (Failed Format, R = 0.0)
+rollout = "...thinking...The final answer is 62."
+assert reward_fn(rollout, ground_truth) == 0.0
+
+print("✅ reward_fn: Tests passed!")
 
 
 def evaluate_model(llm: LLM, sampling_params: SamplingParams, eval_prompts: List[str], eval_answers: List[Dict]) -> Dict[str, Any]:
