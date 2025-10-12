@@ -20,6 +20,8 @@ import random
 from typing import Callable, Dict, List, Tuple, Any
 import logging
 import warnings
+import argparse
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -285,6 +287,18 @@ assert reward_fn(rollout, ground_truth) == 0.0
 print("✅ reward_fn: Tests passed!")
 
 
+def reward_fn_format(generated_text: str, ground_truth: Dict) -> float:
+    """
+    Reward function for the formatting phase.
+    Returns 1.0 if an <answer> tag is present, 0.0 otherwise.
+    """
+    equation = _extract_answer(generated_text)
+    if equation is not None:
+        return 1.0
+    else:
+        return 0.0
+
+
 def evaluate_model(llm: LLM, sampling_params: SamplingParams, eval_prompts: List[str], eval_answers: List[Dict]) -> Dict[str, Any]:
     rollouts = llm.generate(eval_prompts, sampling_params)
     examples, rewards, output_token_lengths = [], [], []
@@ -472,7 +486,7 @@ def compute_loss(
     loss = -torch.minimum(unclipped_term, clipped_term)
 
     ### END YOUR CODE ###
-    return loss
+    return loss, {}
 
 
 def masked_mean(tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -549,12 +563,20 @@ def train(
     optimizer: torch.optim.Optimizer, scheduler, n_grpo_steps: int, rollout_batch_size: int,
     group_size: int, gradient_accumulation_steps: int, clip_range: float, use_std_normalization: bool,
     advantage_eps: float, device: str, eval_every: int = 5, writer: SummaryWriter = None, seed: int,
-    loss_type: str = "grpo", max_completion_length: int = 256,
+    loss_type: str = "grpo", max_completion_length: int = 256, output_dir: str, training_phase: str = "reasoning",
 ) -> None:
+    if training_phase == "format":
+        current_reward_fn = reward_fn_format
+        print("--- Running Training Phase 1: Formatting ---")
+    else: # reasoning
+        current_reward_fn = reward_fn
+        print("--- Running Training Phase 2: Reasoning ---")
+
     n_prompts_per_rollout_batch = rollout_batch_size // group_size
     micro_train_batch_size = rollout_batch_size // gradient_accumulation_steps
     random.seed(seed)
     train_step = 0
+    best_accuracy = -1.0
 
     metrics = evaluate_model(llm, sampling_params, eval_prompts, eval_answers)
     if writer:
@@ -569,7 +591,7 @@ def train(
         answers_dup = duplicate_data(answers_batch, group_size)
         avg_output_tokens = sum(rollout_tokens) / len(rollout_tokens) if rollout_tokens else 0.0
         advantages, _, reward_meta = compute_group_normalized_advantages(
-            rollout_response, answers_dup, reward_fn, group_size, advantage_eps, use_std_normalization
+            rollout_response, answers_dup, current_reward_fn, group_size, advantage_eps, use_std_normalization
         )
         tokenized = tokenize_rollouts(rollout_input, rollout_response, tokenizer)
         optimizer.zero_grad()
@@ -593,42 +615,70 @@ def train(
         if train_step % eval_every == 0:
             metrics = evaluate_model(llm, sampling_params, eval_prompts, eval_answers)
             log_eval(metrics, writer, train_step)
+            
+            current_accuracy = metrics['accuracy']
+            if current_accuracy > best_accuracy:
+                best_accuracy = current_accuracy
+                print(f"New best accuracy: {best_accuracy:.2f}%. Saving checkpoint...")
+                best_checkpoint_dir = Path(output_dir) / "best_checkpoint"
+                best_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                policy.save_pretrained(str(best_checkpoint_dir))
+                tokenizer.save_pretrained(str(best_checkpoint_dir))
+                print(f"Saved best checkpoint to {best_checkpoint_dir}")
 
 
-def init_policy(model_id: str, device: str) -> Tuple[PreTrainedModel, AutoTokenizer]:
+def init_policy(model_id: str, device: str, checkpoint_path: str | None = None) -> Tuple[PreTrainedModel, AutoTokenizer]:
+    model_path = checkpoint_path if checkpoint_path else model_id
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2", use_cache=False
+        model_path, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2", use_cache=False
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer_path = checkpoint_path if checkpoint_path else model_id
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     model.to(device).train()
+    if checkpoint_path:
+        print(f"Loaded policy from checkpoint: {checkpoint_path}")
     return model, tokenizer
 
 
 def main() -> None:
-    # Hyperparameters
-    model_id = "Qwen/Qwen3-1.7B"
-    device = "cuda"
-    seed, gpu_mem_util = 42, 0.4
-    n_grpo_steps, rollout_batch_size, group_size, grad_acc_steps = 80, 128, 8, 32
-    lr, clip_range, adv_eps = 7e-6, 0.2, 1e-6
-    temperature, min_tokens = 1.0, 4
-    eval_every = 10
+    parser = argparse.ArgumentParser(description="GRPO Training for Countdown Task")
+    parser.add_argument("--model_id", type=str, default="Qwen/Qwen3-1.7B", help="Base model ID")
+    parser.add_argument("--load_checkpoint_path", type=str, default=None, help="Path to load a model checkpoint to continue training.")
+    parser.add_argument("--device", type=str, default="cuda", help="Device to train on")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--gpu_mem_util", type=float, default=0.4, help="GPU memory utilization for vLLM")
+    parser.add_argument("--n_grpo_steps", type=int, default=80, help="Number of GRPO steps")
+    parser.add_argument("--rollout_batch_size", type=int, default=128, help="Rollout batch size")
+    parser.add_argument("--group_size", type=int, default=8, help="Group size for GRPO")
+    parser.add_argument("--grad_acc_steps", type=int, default=32, help="Gradient accumulation steps")
+    parser.add_argument("--lr", type=float, default=7e-6, help="Learning rate")
+    parser.add_argument("--clip_range", type=float, default=0.2, help="PPO clip range")
+    parser.add_argument("--adv_eps", type=float, default=1e-6, help="Advantage normalization epsilon")
+    parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
+    parser.add_argument("--min_tokens", type=int, default=4, help="Minimum tokens to generate")
+    parser.add_argument("--eval_every", type=int, default=10, help="Evaluate every N steps")
+    parser.add_argument("--training_phase", type=str, default="reasoning", choices=["format", "reasoning"], help="Training phase: 'format' or 'reasoning'")
+    parser.add_argument("--loss_type", type=str, default="grpo", choices=["grpo", "dr_grpo"], help="Loss type")
+    parser.add_argument("--max_tokens", type=int, default=256, help="Max tokens to generate")
+    parser.add_argument("--output_dir", type=str, default="./output", help="Directory to save outputs")
 
-    # CHANGING HYPERPARAMETERS for main assignment
-    loss_type = "grpo" # or "dr_grpo"
-    max_tokens = 256 # or 512, 1024
-    
+    args = parser.parse_args()
+
     # Initialization
-    use_std_norm = loss_type == "dr_grpo"
-    policy, tokenizer = init_policy(model_id=model_id, device=device)
-    llm = init_vllm(model_id=model_id, device=device, seed=seed, gpu_memory_utilization=gpu_mem_util)
-    sampling_params = init_sampling_params(temperature=temperature, min_tokens=min_tokens, max_tokens=max_tokens)
+    use_std_norm = args.loss_type == "dr_grpo"
+    policy, tokenizer = init_policy(model_id=args.model_id, device=args.device, checkpoint_path=args.load_checkpoint_path)
+    
+    # If continuing training, we still initialize vLLM with the base model, then load weights.
+    vllm_model_id = args.model_id
+    llm = init_vllm(model_id=vllm_model_id, device=args.device, seed=args.seed, gpu_memory_utilization=args.gpu_mem_util)
+    
+    sampling_params = init_sampling_params(temperature=args.temperature, min_tokens=args.min_tokens, max_tokens=args.max_tokens)
     
     # Dataset
     def build_dataset(split):
         data = []
         for ex in split:
-            prompt = TEMPLATE.format(numbers=ex["nums"], target=ex["target"], max_tokens=max_tokens)
+            prompt = TEMPLATE.format(numbers=ex["nums"], target=ex["target"], max_tokens=args.max_tokens)
             prompt = tokenizer.apply_chat_template(
                 [dict(role="system", content="You are a helpful assistant."),
                 dict(role="user", content=prompt)],
@@ -644,33 +694,33 @@ def main() -> None:
     eval_examples = build_dataset(eval_data)
     
     # Optimizer and Scheduler
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=1e-2, betas=(0.9, 0.95))
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=1e-2, betas=(0.9, 0.95))
     scheduler = get_constant_schedule_with_warmup(optimizer=optimizer, num_warmup_steps=0)
     
     # Logging
     timestamp = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-    log_dir = os.path.join("./output", "tb", f"hw_a2_{loss_type}", str(timestamp))
-    os.makedirs(log_dir, exist_ok=True)
-    writer = SummaryWriter(log_dir=log_dir)
+    log_dir = Path(args.output_dir) / "tb" / f"hw_a2_{args.loss_type}" / str(timestamp)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(log_dir))
     
     # Training
     train(
         policy=policy, tokenizer=tokenizer, llm=llm, sampling_params=sampling_params,
         train_prompts=[ex["prompt"] for ex in train_examples], train_answers=[ex["answer"] for ex in train_examples],
         eval_prompts=[ex["prompt"] for ex in eval_examples], eval_answers=[ex["answer"] for ex in eval_examples],
-        optimizer=optimizer, scheduler=scheduler, n_grpo_steps=n_grpo_steps,
-        rollout_batch_size=rollout_batch_size, group_size=group_size,
-        gradient_accumulation_steps=grad_acc_steps, clip_range=clip_range,
-        use_std_normalization=use_std_norm, advantage_eps=adv_eps, device=device,
-        eval_every=eval_every, writer=writer, seed=seed, loss_type=loss_type,
-        max_completion_length=max_tokens
+        optimizer=optimizer, scheduler=scheduler, n_grpo_steps=args.n_grpo_steps,
+        rollout_batch_size=args.rollout_batch_size, group_size=args.group_size,
+        gradient_accumulation_steps=args.grad_acc_steps, clip_range=args.clip_range,
+        use_std_normalization=use_std_norm, advantage_eps=args.adv_eps, device=args.device,
+        eval_every=args.eval_every, writer=writer, seed=args.seed, loss_type=args.loss_type,
+        max_completion_length=args.max_tokens, output_dir=args.output_dir, training_phase=args.training_phase
     )
     
     # Save model
-    out_dir = os.path.join("./output", f"hw_a2_solution_{timestamp}")
-    os.makedirs(out_dir, exist_ok=True)
-    policy.save_pretrained(out_dir)
-    tokenizer.save_pretrained(out_dir)
+    out_dir = Path(args.output_dir) / f"hw_a2_solution_{timestamp}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    policy.save_pretrained(str(out_dir))
+    tokenizer.save_pretrained(str(out_dir))
     print(f"Saved model and tokenizer to {out_dir}")
     writer.close()
 
